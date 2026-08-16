@@ -1,0 +1,605 @@
+// Medzen Pharmacy — data model
+// PostgreSQL + Prisma. UUID primary keys, timestamps everywhere,
+// soft deletion on catalog + people records, hard delete only for ephemera.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------- identity
+
+enum StaffRole {
+  SUPER_ADMIN
+  PHARMACY_ADMIN
+  PHARMACIST
+  CONTENT_MANAGER
+}
+
+model User {
+  id           String    @id @default(uuid()) @db.Uuid
+  email        String    @unique
+  name         String
+  passwordHash String
+  role         StaffRole @default(PHARMACIST)
+  // Grants beyond the role baseline, e.g. ["cms.write"].
+  extraPerms   String[]  @default([])
+  isActive     Boolean   @default(true)
+  lastLoginAt  DateTime?
+  // Lockout state for brute-force protection.
+  failedLogins Int       @default(0)
+  lockedUntil  DateTime?
+  isDemo       Boolean   @default(false)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  deletedAt    DateTime?
+
+  sessions              Session[]
+  apiTokens             StaffApiToken[]
+  auditLogs             AuditLog[]
+  assignedPrescriptions PrescriptionRequest[] @relation("AssignedPharmacist")
+  prescriptionNotes     PrescriptionNote[]
+  inventoryTxns         InventoryTransaction[]
+  orderEvents           OrderEvent[]
+
+  @@index([role])
+  @@index([deletedAt])
+}
+
+model Session {
+  id        String   @id @default(uuid()) @db.Uuid
+  // JWT id (`jti` claim). The raw cookie value is the JWT itself; we
+  // only record this id so a session can be revoked server-side.
+  jti       String   @unique
+  userId    String   @db.Uuid
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  // Set when a staff member signs out or "log out everywhere" is hit.
+  // Rows with this set refuse the corresponding JWT on every request.
+  revokedAt DateTime?
+  ip        String?
+  userAgent String?
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@index([revokedAt])
+}
+
+// ---------------------------------------------------------------- catalog
+
+model Category {
+  id          String    @id @default(uuid()) @db.Uuid
+  name        String
+  slug        String    @unique
+  description String?
+  imageKey    String?
+  icon        String?
+  isActive    Boolean   @default(true)
+  sortOrder   Int       @default(0)
+  isDemo      Boolean   @default(false)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  products Product[]
+
+  @@index([isActive, sortOrder])
+  @@index([deletedAt])
+}
+
+model Brand {
+  id          String    @id @default(uuid()) @db.Uuid
+  name        String
+  slug        String    @unique
+  description String?
+  logoKey     String?
+  isActive    Boolean   @default(true)
+  isDemo      Boolean   @default(false)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  products Product[]
+
+  @@index([isActive])
+  @@index([deletedAt])
+}
+
+enum ProductStatus {
+  DRAFT
+  PUBLISHED
+}
+
+model Product {
+  id          String  @id @default(uuid()) @db.Uuid
+  name        String
+  slug        String  @unique
+  sku         String  @unique
+  description String?
+  // Short "what it is" line used on cards and meta descriptions.
+  summary     String?
+  // Directions / how to use. Never auto-generated, admin-authored only.
+  usageInfo   String?
+  keyInfo     String?
+
+  // Fils-free: prices stored as integers in AED fils (1 AED = 100 fils)
+  // so arithmetic never touches floating point.
+  priceFils     Int?
+  compareAtFils Int?
+  currency      String @default("AED")
+
+  categoryId String?   @db.Uuid
+  category   Category? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  brandId    String?   @db.Uuid
+  brand      Brand?    @relation(fields: [brandId], references: [id], onDelete: SetNull)
+
+  prescriptionRequired Boolean       @default(false)
+  status               ProductStatus @default(DRAFT)
+  isFeatured           Boolean       @default(false)
+  viewCount            Int           @default(0)
+
+  metaTitle       String?
+  metaDescription String?
+
+  isDemo    Boolean   @default(false)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  images     ProductImage[]
+  inventory  Inventory?
+  orderItems OrderItem[]
+
+  @@index([status, deletedAt])
+  @@index([categoryId])
+  @@index([brandId])
+  @@index([isFeatured])
+  @@index([name])
+}
+
+model ProductImage {
+  id        String   @id @default(uuid()) @db.Uuid
+  productId String   @db.Uuid
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  key       String
+  alt       String?
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+
+  @@index([productId, sortOrder])
+}
+
+// ---------------------------------------------------------------- inventory
+
+model Inventory {
+  id        String  @id @default(uuid()) @db.Uuid
+  productId String  @unique @db.Uuid
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  quantity     Int       @default(0)
+  lowStockAt   Int       @default(5)
+  batchNumber  String?
+  expiryDate   DateTime?
+  shelfLocation String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  transactions InventoryTransaction[]
+
+  @@index([quantity])
+  @@index([expiryDate])
+}
+
+enum InventoryReason {
+  RECEIVED
+  SOLD
+  DAMAGED
+  EXPIRED
+  CORRECTION
+  RETURNED
+}
+
+model InventoryTransaction {
+  id          String          @id @default(uuid()) @db.Uuid
+  inventoryId String          @db.Uuid
+  inventory   Inventory       @relation(fields: [inventoryId], references: [id], onDelete: Cascade)
+  // Signed: positive is stock in, negative is stock out.
+  delta       Int
+  quantityAfter Int
+  reason      InventoryReason
+  note        String?
+  userId      String?         @db.Uuid
+  user        User?           @relation(fields: [userId], references: [id], onDelete: SetNull)
+  createdAt   DateTime        @default(now())
+
+  @@index([inventoryId, createdAt])
+}
+
+// ---------------------------------------------------------------- customers
+
+model Customer {
+  id        String    @id @default(uuid()) @db.Uuid
+  name      String
+  phone     String    @unique
+  email     String?
+  address   String?
+  notes     String?
+  isDemo    Boolean   @default(false)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  orders        Order[]
+  prescriptions PrescriptionRequest[]
+  sessions      CustomerSession[]
+
+  @@index([phone])
+  @@index([deletedAt])
+}
+
+model CustomerSession {
+  id        String   @id @default(uuid()) @db.Uuid
+  // JWT id (`jti` claim) for the customer's remember-me cookie. Lets a
+  // customer revoke their own session or "sign out everywhere".
+  jti       String   @unique
+  customerId String   @db.Uuid
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  revokedAt DateTime?
+  ip        String?
+  userAgent String?
+  createdAt DateTime @default(now())
+
+  @@index([customerId])
+  @@index([expiresAt])
+}
+
+// ---------------------------------------------------------------- orders
+
+enum OrderStatus {
+  PENDING
+  CONFIRMED
+  PREPARING
+  READY
+  OUT_FOR_DELIVERY
+  COMPLETED
+  CANCELLED
+}
+
+enum PaymentStatus {
+  UNPAID
+  PAY_ON_DELIVERY
+  PAID
+  REFUNDED
+}
+
+enum FulfilmentType {
+  DELIVERY
+  COLLECTION
+}
+
+model Order {
+  id          String @id @default(uuid()) @db.Uuid
+  // Human-facing reference, e.g. MZ-25081-0042.
+  reference   String @unique
+
+  customerId String?   @db.Uuid
+  customer   Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+
+  // Denormalised contact snapshot — an order must stay readable
+  // even if the customer record is later removed.
+  customerName  String
+  customerPhone String
+  customerEmail String?
+
+  fulfilment      FulfilmentType @default(DELIVERY)
+  deliveryAddress String?
+  notes           String?
+
+  subtotalFils Int           @default(0)
+  deliveryFils Int           @default(0)
+  totalFils    Int           @default(0)
+  currency     String        @default("AED")
+
+  status        OrderStatus   @default(PENDING)
+  paymentStatus PaymentStatus @default(UNPAID)
+
+  isDemo    Boolean   @default(false)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  items  OrderItem[]
+  events OrderEvent[]
+
+  @@index([status, createdAt])
+  @@index([customerId])
+  @@index([createdAt])
+}
+
+model OrderItem {
+  id        String   @id @default(uuid()) @db.Uuid
+  orderId   String   @db.Uuid
+  order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId String?  @db.Uuid
+  product   Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  // Line snapshot, so historical orders never shift when the catalog changes.
+  productName String
+  sku         String?
+  unitFils    Int
+  quantity    Int
+  lineFils    Int
+  prescriptionRequired Boolean @default(false)
+
+  createdAt DateTime @default(now())
+
+  @@index([orderId])
+  @@index([productId])
+}
+
+model OrderEvent {
+  id        String       @id @default(uuid()) @db.Uuid
+  orderId   String       @db.Uuid
+  order     Order        @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  status    OrderStatus?
+  message   String
+  userId    String?      @db.Uuid
+  user      User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+  createdAt DateTime     @default(now())
+
+  @@index([orderId, createdAt])
+}
+
+// ---------------------------------------------------------------- prescriptions
+
+enum PrescriptionStatus {
+  PENDING
+  UNDER_REVIEW
+  CLARIFICATION_REQUESTED
+  APPROVED
+  REJECTED
+  COMPLETED
+}
+
+model PrescriptionRequest {
+  id        String @id @default(uuid()) @db.Uuid
+  reference String @unique
+
+  customerId String?   @db.Uuid
+  customer   Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+
+  customerName  String
+  customerPhone String
+  customerEmail String?
+  notes         String?
+
+  status             PrescriptionStatus @default(PENDING)
+  assignedToId       String?            @db.Uuid
+  assignedTo         User?              @relation("AssignedPharmacist", fields: [assignedToId], references: [id], onDelete: SetNull)
+  // Message shown to the customer when contacted; never contains clinical detail.
+  resolutionMessage  String?
+  reviewedAt         DateTime?
+
+  isDemo    Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  files PrescriptionFile[]
+  notesLog PrescriptionNote[]
+
+  @@index([status, createdAt])
+  @@index([customerPhone])
+}
+
+model PrescriptionFile {
+  id             String              @id @default(uuid()) @db.Uuid
+  requestId      String              @db.Uuid
+  request        PrescriptionRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  // Opaque storage key under a private prefix. Never rendered to the public site.
+  key            String              @unique
+  originalName   String
+  mimeType       String
+  sizeBytes      Int
+  checksumSha256 String
+  createdAt      DateTime            @default(now())
+
+  @@index([requestId])
+}
+
+model PrescriptionNote {
+  id        String              @id @default(uuid()) @db.Uuid
+  requestId String              @db.Uuid
+  request   PrescriptionRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  userId    String?             @db.Uuid
+  user      User?               @relation(fields: [userId], references: [id], onDelete: SetNull)
+  body      String
+  createdAt DateTime            @default(now())
+
+  @@index([requestId, createdAt])
+}
+
+// ---------------------------------------------------------------- messages & content
+
+enum MessageStatus {
+  NEW
+  IN_PROGRESS
+  RESOLVED
+}
+
+model ContactMessage {
+  id        String        @id @default(uuid()) @db.Uuid
+  name      String
+  phone     String
+  email     String?
+  subject   String
+  message   String
+  status    MessageStatus @default(NEW)
+  isDemo    Boolean       @default(false)
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+
+  @@index([status, createdAt])
+}
+
+model Service {
+  id          String    @id @default(uuid()) @db.Uuid
+  title       String
+  slug        String    @unique
+  description String
+  icon        String    @default("Stethoscope")
+  ctaLabel    String?
+  ctaHref     String?
+  isActive    Boolean   @default(true)
+  sortOrder   Int       @default(0)
+  isDemo      Boolean   @default(false)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  @@index([isActive, sortOrder])
+}
+
+model Banner {
+  id        String    @id @default(uuid()) @db.Uuid
+  title     String
+  subtitle  String?
+  imageKey  String?
+  ctaLabel  String?
+  ctaHref   String?
+  isActive  Boolean   @default(true)
+  sortOrder Int       @default(0)
+  startsAt  DateTime?
+  endsAt    DateTime?
+  isDemo    Boolean   @default(false)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  @@index([isActive, sortOrder])
+}
+
+model Faq {
+  id        String   @id @default(uuid()) @db.Uuid
+  question  String
+  answer    String
+  category  String?
+  sortOrder Int      @default(0)
+  isPublished Boolean @default(true)
+  isDemo    Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([isPublished, sortOrder])
+}
+
+model Testimonial {
+  id          String   @id @default(uuid()) @db.Uuid
+  authorName  String
+  authorTitle String?
+  body        String
+  rating      Int?
+  // Testimonials are only ever entered by the business. Nothing is
+  // auto-generated, and unverified entries stay unpublished.
+  isVerified  Boolean  @default(false)
+  isPublished Boolean  @default(false)
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([isPublished, sortOrder])
+}
+
+// ---------------------------------------------------------------- ops
+
+enum NotificationType {
+  NEW_ORDER
+  NEW_PRESCRIPTION
+  LOW_STOCK
+  NEW_MESSAGE
+  NEW_CUSTOMER
+}
+
+model Notification {
+  id        String           @id @default(uuid()) @db.Uuid
+  type      NotificationType
+  title     String
+  body      String?
+  href      String?
+  readAt    DateTime?
+  createdAt DateTime         @default(now())
+
+  @@index([readAt, createdAt])
+}
+
+model StaffApiToken {
+  id        String   @id @default(uuid()) @db.Uuid
+  // JWT id (`jti` claim) for the bearer token. Revoking the token is
+  // a single UPDATE here — the JWT itself is self-contained otherwise.
+  jti       String   @unique
+  userId    String   @db.Uuid
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // Human label for the token ("ci-deploy", "analytics-cron", …).
+  label     String
+  // Hash of the plaintext token shown once on issue; the plaintext is
+  // never stored. Useful for diagnostics ("which token did what").
+  tokenDigest String  @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  lastUsedAt DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model AuditLog {
+  id         String   @id @default(uuid()) @db.Uuid
+  userId     String?  @db.Uuid
+  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  actorLabel String
+  action     String
+  entity     String
+  entityId   String?
+  // Redacted diff. Never stores prescription contents or credentials.
+  meta       Json?
+  ip         String?
+  createdAt  DateTime @default(now())
+
+  @@index([entity, entityId])
+  @@index([createdAt])
+}
+
+model SiteSetting {
+  // Single-row settings document keyed by a constant id.
+  id        String   @id @default("default")
+  data      Json
+  updatedAt DateTime @updatedAt
+}
+
+model PageView {
+  id        String   @id @default(uuid()) @db.Uuid
+  // Privacy-conscious analytics: path + day bucket only.
+  // No IP, no user agent, no cross-page identifier.
+  path      String
+  day       DateTime @db.Date
+  count     Int      @default(1)
+
+  @@unique([path, day])
+  @@index([day])
+}
+
+model SearchQuery {
+  id        String   @id @default(uuid()) @db.Uuid
+  term      String
+  results   Int      @default(0)
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([term])
+}
